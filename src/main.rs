@@ -1,19 +1,25 @@
-// The second trial of the entry of "my sites" (docs/requirements/53): the
-// entry is the web server. It chooses the certificate by the name asked
-// for, finds the site by host and the longest path prefix, applies the
-// site's rewrite rules (Apache's, nginx's or IIS's, read into one form),
-// serves files itself and hands PHP to the site's environment, which is
-// PHP-FPM alone, over FastCGI. Before that it asks the backend, which
-// starts the environment where it is not running.
+// The entry of "my sites" (docs/requirements/53 of tominadev/incus): the
+// web server in front of every user's site on a host. It chooses the
+// certificate by the name asked for, finds the site by host and the longest
+// path prefix, applies the site's rewrite rules (Apache's, nginx's or IIS's,
+// read into one form), serves files itself and hands PHP to the site's
+// environment, PHP-FPM alone, over FastCGI.
+//
+// What it serves is written by the site agent (sitesd) beside it: routes in
+// entry.json and certificates in certs/, under SITES_DIR. They are read
+// again as they change; a site's .htaccess is read again as it changes,
+// at the next request. Before a request goes to an environment the agent is
+// asked for it (SITES_AGENT): it starts one that is stopped and says where
+// it listens.
 
 mod fcgi;
 mod files;
 mod rewrite;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,22 +29,41 @@ use pingora::prelude::*;
 use pingora::tls::pkey::{PKey, Private};
 use pingora::tls::ssl::{NameType, SslRef};
 use pingora::tls::x509::X509;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-const DIR: &str = "/poc";
-const BACKEND: &str = "127.0.0.1:18090";
+fn setting(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// A route as the agent writes it (sitesd's EntryRoute).
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+struct RouteIn {
+    host: String,
+    prefix: String,
+    env: String,
+    root: String,
+    env_root: String,
+    rules: String,
+    text: String,
+    off: String,
+}
 
 #[derive(Clone)]
 struct Route {
     host: String,
     prefix: String,
+    // The environment that runs its PHP; empty for a site of files alone.
     env: String,
-    // Where its PHP-FPM listens; "-" for a site of files alone.
-    fcgi: String,
     // The site's folder as the entry sees it, and as its environment does.
     root: PathBuf,
     fpm_root: String,
+    // "auto": the .htaccess in its folder, read as it changes; else rules given whole.
+    auto: bool,
     rules: Arc<rewrite::Rules>,
+    // What is answered instead of the site: "" for the site, "off", "expired".
+    off: String,
 }
 
 #[derive(Default)]
@@ -49,60 +74,93 @@ struct Table {
 
 type Shared = Arc<RwLock<Table>>;
 
-// rules_of reads a site's rules: "auto" is the .htaccess in its folder;
-// else a file, read by its ending (.nginx, .config for IIS, else Apache's).
-fn rules_of(root: &PathBuf, source: &str) -> rewrite::Rules {
-    let path = if source == "auto" { root.join(".htaccess") } else { PathBuf::from(source) };
-    let Ok(text) = std::fs::read_to_string(&path) else { return rewrite::Rules::default() };
-    let name = path.to_string_lossy();
-    if name.ends_with(".nginx") {
-        rewrite::nginx(&text)
-    } else if name.ends_with(".config") {
-        rewrite::iis(&text)
-    } else {
-        rewrite::htaccess(&text, "/")
+/// The .htaccess of the sites' folders as last read, by folder, with the
+/// moment the file was changed then (none: there was no file).
+type Rules = Arc<Mutex<HashMap<PathBuf, (Option<SystemTime>, Arc<rewrite::Rules>)>>>;
+
+// htaccess gives the rules of the .htaccess in a folder, read again where
+// the file changed since it was last read.
+fn htaccess(cache: &Rules, root: &Path) -> Arc<rewrite::Rules> {
+    let file = root.join(".htaccess");
+    let changed = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+    if let Some((at, r)) = cache.lock().unwrap().get(root) {
+        if *at == changed {
+            return r.clone();
+        }
     }
+    let r = Arc::new(match std::fs::read_to_string(&file) {
+        Ok(text) => {
+            let r = rewrite::htaccess(&text, "/");
+            for s in &r.skipped {
+                warn!("{}: rule passed over: {s}", file.display());
+            }
+            r
+        }
+        Err(_) => rewrite::Rules::default(),
+    });
+    cache.lock().unwrap().insert(root.to_path_buf(), (changed, r.clone()));
+    r
 }
 
-// load reads the certificates and the routes: a line each of
-// "host prefix environment fcgi-address folder folder-in-environment rules".
-fn load(told: &mut HashMap<String, usize>) -> Table {
+// load reads the certificates and the routes the agent wrote.
+fn load(dir: &str) -> Table {
     let mut t = Table::default();
-    if let Ok(dir) = std::fs::read_dir(format!("{DIR}/certs")) {
-        for e in dir.flatten() {
+    if let Ok(list) = std::fs::read_dir(format!("{dir}/certs")) {
+        for e in list.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) != Some("crt") {
                 continue;
             }
-            let name = p.file_stem().unwrap().to_string_lossy().to_string();
+            // A certificate for every name under a domain is kept as _.domain.
+            let name = p.file_stem().unwrap().to_string_lossy().replacen('_', "*", 1);
             let (Ok(c), Ok(k)) = (std::fs::read(&p), std::fs::read(p.with_extension("key"))) else { continue };
-            if let (Ok(c), Ok(k)) = (X509::from_pem(&c), PKey::private_key_from_pem(&k)) {
-                t.certs.insert(name, (c, k));
+            match (X509::from_pem(&c), PKey::private_key_from_pem(&k)) {
+                (Ok(c), Ok(k)) => {
+                    t.certs.insert(name, (c, k));
+                }
+                _ => warn!("{}: not a certificate and its key", p.display()),
             }
         }
     }
-    if let Ok(s) = std::fs::read_to_string(format!("{DIR}/routes.txt")) {
-        for line in s.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() != 7 || line.starts_with('#') {
-                continue;
-            }
-            let root = PathBuf::from(f[4]);
-            let rules = rules_of(&root, f[6]);
-            // What of a site's rules was passed over is said once.
-            let key = format!("{}{}", f[0], f[1]);
-            if told.get(&key) != Some(&rules.skipped.len()) {
-                told.insert(key, rules.skipped.len());
-                for s in &rules.skipped {
-                    warn!("{}{}: rule passed over: {s}", f[0], f[1]);
-                }
-            }
-            t.routes.push(Route { host: f[0].into(), prefix: f[1].trim_end_matches('/').into(), env: f[2].into(), fcgi: f[3].into(), root, fpm_root: f[5].into(), rules: Arc::new(rules) });
+    let routes: Vec<RouteIn> = match std::fs::read(format!("{dir}/entry.json")) {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+            warn!("entry.json: {e}");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    };
+    for r in routes {
+        let rules = match r.rules.as_str() {
+            "nginx" => rewrite::nginx(&r.text),
+            "iis" => rewrite::iis(&r.text),
+            _ => rewrite::Rules::default(),
+        };
+        for s in &rules.skipped {
+            warn!("{}{}: rule passed over: {s}", r.host, r.prefix);
         }
+        t.routes.push(Route {
+            host: r.host.to_lowercase(),
+            prefix: r.prefix.trim_end_matches('/').into(),
+            env: r.env,
+            root: PathBuf::from(r.root),
+            fpm_root: r.env_root,
+            auto: r.rules != "nginx" && r.rules != "iis",
+            rules: Arc::new(rules),
+            off: r.off,
+        });
     }
     // The longest prefix first.
     t.routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
     t
+}
+
+// certificate is the certificate for a name: its own, or one for every name under its domain.
+fn certificate(t: &Table, name: &str) -> Option<(X509, PKey<Private>)> {
+    if let Some(c) = t.certs.get(name) {
+        return Some(c.clone());
+    }
+    let (_, parent) = name.split_once('.')?;
+    t.certs.get(&format!("*.{parent}")).cloned()
 }
 
 struct Certs(Shared);
@@ -111,7 +169,7 @@ struct Certs(Shared);
 impl pingora::listeners::TlsAccept for Certs {
     async fn certificate_callback(&self, ssl: &mut SslRef) {
         let name = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_lowercase();
-        let found = self.0.read().unwrap().certs.get(&name).cloned();
+        let found = certificate(&self.0.read().unwrap(), &name);
         match found {
             Some((cert, key)) => {
                 pingora::tls::ext::ssl_use_certificate(ssl, &cert).unwrap();
@@ -125,19 +183,29 @@ impl pingora::listeners::TlsAccept for Certs {
 struct Entry {
     table: Shared,
     tls: bool,
+    agent: String,
+    rules: Rules,
 }
 
-// ask asks the backend whether an environment can take requests: it starts
-// the environment where it is not running and answers once it is.
-async fn ask(env: &str) -> bool {
+// ask asks the agent for an environment: it starts one that is not running
+// and answers once it takes requests, with where it listens. Else the
+// agent's answer: 423 for one that is off, 404 for none, 503.
+async fn ask(agent: &str, env: &str) -> std::result::Result<String, u16> {
     let run = async {
-        let mut s = tokio::net::TcpStream::connect(BACKEND).await.ok()?;
-        s.write_all(format!("GET /ask?env={env} HTTP/1.0\r\nHost: backend\r\n\r\n").as_bytes()).await.ok()?;
+        let mut s = tokio::net::TcpStream::connect(agent).await.ok()?;
+        s.write_all(format!("GET /ask?env={env} HTTP/1.0\r\nHost: agent\r\n\r\n").as_bytes()).await.ok()?;
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.ok()?;
-        Some(buf.starts_with(b"HTTP/1.0 200") || buf.starts_with(b"HTTP/1.1 200"))
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let code: u16 = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(502);
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.trim().to_string()).unwrap_or_default();
+        Some((code, body))
     };
-    matches!(tokio::time::timeout(Duration::from_secs(30), run).await, Ok(Some(true)))
+    match tokio::time::timeout(Duration::from_secs(30), run).await {
+        Ok(Some((200, addr))) if !addr.is_empty() => Ok(addr),
+        Ok(Some((code, _))) => Err(code),
+        _ => Err(504),
+    }
 }
 
 // decode undoes the %XX of a path; none where it then holds a NUL or goes up out of where it is.
@@ -267,7 +335,7 @@ impl Entry {
 
     // php hands the request to the site's PHP-FPM and sends on what it answers.
     #[allow(clippy::too_many_arguments)]
-    async fn php(&self, session: &mut Session, route: &Route, host: &str, script: &str, path_info: &str, query: &str, uri: &str) -> Result<bool> {
+    async fn php(&self, session: &mut Session, route: &Route, fcgi_addr: &str, host: &str, script: &str, path_info: &str, query: &str, uri: &str) -> Result<bool> {
         let req = session.req_header();
         // What the visitor asked for, with its port: over HTTP/2 there is no
         // Host header, the name comes as the request's authority.
@@ -318,7 +386,7 @@ impl Entry {
             p.push(("HTTP_HOST".into(), authority));
         }
         let h2 = format!("{:?}", req.version).contains("2");
-        let Ok(mut conn) = fcgi::begin(&route.fcgi, &p).await else {
+        let Ok(mut conn) = fcgi::begin(fcgi_addr, &p).await else {
             return plain(session, 502, "the site's PHP does not answer\n").await;
         };
         while let Some(chunk) = session.read_request_body().await? {
@@ -367,9 +435,9 @@ impl ProxyHttp for Entry {
         let raw_path = req.uri.path().to_string();
         let query = req.uri.query().unwrap_or("").to_string();
         let uri = if query.is_empty() { raw_path.clone() } else { format!("{raw_path}?{query}") };
-        // A certificate being issued is proved over plain HTTP: to the backend, as it is.
+        // A certificate being issued is proved over plain HTTP: to the agent, which keeps the answers.
         if raw_path.starts_with("/.well-known/acme-challenge/") {
-            *ctx = Some(BACKEND.to_string());
+            *ctx = Some(self.agent.clone());
             return Ok(false);
         }
         if !self.tls {
@@ -386,14 +454,17 @@ impl ProxyHttp for Entry {
         if path == route.prefix && !route.prefix.is_empty() {
             return redirect(session, 301, &format!("{path}/{}", if query.is_empty() { String::new() } else { format!("?{query}") })).await;
         }
-        if route.fcgi != "-" && !ask(&route.env).await {
-            return plain(session, 503, "the site is starting or cannot be started, try again\n").await;
+        match route.off.as_str() {
+            "" => {}
+            "expired" => return plain(session, 403, "this site has expired\n").await,
+            _ => return plain(session, 403, "this site is off\n").await,
         }
         // The rules see the path inside the site.
         let inside = path[route.prefix.len()..].to_string();
         let headers = req.headers.clone();
         let header = move |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-        let outcome = rewrite::apply(&route.rules, &rewrite::Req { path: inside, query, host: &host, https: true, root: &route.root, header: &header });
+        let rules = if route.auto { htaccess(&self.rules, &route.root) } else { route.rules.clone() };
+        let outcome = rewrite::apply(&rules, &rewrite::Req { path: inside, query, host: &host, https: true, root: &route.root, header: &header });
         let (mut rel, query) = match outcome {
             rewrite::Outcome::Redirect(code, to) => {
                 let to = if to.starts_with('/') { format!("{}{to}", route.prefix) } else { to };
@@ -432,11 +503,16 @@ impl ProxyHttp for Entry {
             }
         }
         if rel.ends_with(".php") {
-            if route.fcgi == "-" {
+            if route.env.is_empty() {
                 return plain(session, 403, "this site runs no PHP\n").await;
             }
+            let addr = match ask(&self.agent, &route.env).await {
+                Ok(a) => a,
+                Err(423) => return plain(session, 403, "this site's environment is off\n").await,
+                Err(_) => return plain(session, 503, "the site is starting or cannot be started, try again\n").await,
+            };
             *ctx = Some(format!("php {}{}", route.env, rel));
-            return self.php(session, &route, &host, &rel, &path_info, &query, &uri).await;
+            return self.php(session, &route, &addr, &host, &rel, &path_info, &query, &uri).await;
         }
         *ctx = Some(format!("file {rel}"));
         self.file(session, &route, &rel).await
@@ -452,29 +528,47 @@ impl ProxyHttp for Entry {
     }
 }
 
+// changed is when what the agent wrote last changed: the routes or the certificates.
+fn changed(dir: &str) -> Option<SystemTime> {
+    let a = std::fs::metadata(format!("{dir}/entry.json")).and_then(|m| m.modified()).ok();
+    let b = std::fs::metadata(format!("{dir}/certs")).and_then(|m| m.modified()).ok();
+    a.max(b)
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let mut told = HashMap::new();
-    let table: Shared = Arc::new(RwLock::new(load(&mut told)));
-    // Read again every two seconds: a certificate, a route or a site's rules changed are there without a restart.
+    let dir = setting("SITES_DIR", "/var/lib/sites");
+    let agent = setting("SITES_AGENT", "127.0.0.1:7071");
+    let table: Shared = Arc::new(RwLock::new(load(&dir)));
+    // Read again as the agent writes: a certificate or a route is there within a second, without a restart.
     let again = table.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(2));
-        let t = load(&mut told);
-        *again.write().unwrap() = t;
+    let watched = dir.clone();
+    std::thread::spawn(move || {
+        let mut last = changed(&watched);
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let now = changed(&watched);
+            if now != last {
+                last = now;
+                let t = load(&watched);
+                info!("read again: {} routes, {} certificates", t.routes.len(), t.certs.len());
+                *again.write().unwrap() = t;
+            }
+        }
     });
+    let rules: Rules = Arc::new(Mutex::new(HashMap::new()));
 
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let mut https = http_proxy_service(&server.configuration, Entry { table: table.clone(), tls: true });
+    let mut https = http_proxy_service(&server.configuration, Entry { table: table.clone(), tls: true, agent: agent.clone(), rules: rules.clone() });
     let mut settings = TlsSettings::with_callbacks(Box::new(Certs(table.clone()))).unwrap();
     settings.enable_h2();
-    https.add_tls_with_settings("0.0.0.0:18443", None, settings);
+    https.add_tls_with_settings(&setting("SITES_HTTPS", "0.0.0.0:443"), None, settings);
     server.add_service(https);
 
-    let mut http = http_proxy_service(&server.configuration, Entry { table, tls: false });
-    http.add_tcp("0.0.0.0:18080");
+    let mut http = http_proxy_service(&server.configuration, Entry { table, tls: false, agent, rules });
+    http.add_tcp(&setting("SITES_HTTP", "0.0.0.0:80"));
     server.add_service(http);
 
     if files::kind(std::path::Path::new("/"), "/").is_none() || files::FALLBACK.load(std::sync::atomic::Ordering::Relaxed) {

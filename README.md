@@ -23,7 +23,7 @@ cargo build --release
 - `trial/setup.sh`：搭测试站点（WordPress、ThinkPHP、Laravel、Discuz 自带的规则），以及对照用的真 Apache、真 nginx。
 - `trial/compare.sh`：同一批请求发给入口和真服务器，逐条比。2026-10-08：147 条里 145 条一致，另 2 条是 nginx 默认的 1 MB 上传限制。
 - `trial/real/`：真的 WordPress、Discuz! X3.5 整站跑（安装、登录、发帖、上传、伪静态）。数据库密码从参数传，不在文件里。
-- 证书和路由表现在从 `/poc/certs`、`/poc/routes.txt` 读，每 2 秒重读一次，以后改成从后端取。
+- 正式运行时（2026-10-08 起）证书和路由由站点代理 sitesd（在 tominadev/incus 的 `cmd/sitesd`）写在 `SITES_DIR`（默认 `/var/lib/sites`）下：`entry.json` 和 `certs/`，入口一秒内读到；站点目录里的 `.htaccess` 改了下一个请求就生效。环境在哪由站点代理回答（`SITES_AGENT`，默认 `127.0.0.1:7071`），入口监听 `SITES_HTTP` / `SITES_HTTPS`（默认 `:80` / `:443`）。`trial/` 里的脚本是样板时期的，用的还是旧的文件格式。
 
 ## 还没做的
 
