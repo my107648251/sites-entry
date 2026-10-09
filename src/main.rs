@@ -1,7 +1,9 @@
 // The entry of "my sites" (docs/requirements/53 of tominadev/incus): the
 // web server in front of every user's site on a host. It chooses the
 // certificate by the name asked for, finds the site by host and the longest
-// path prefix, applies the site's rewrite rules (Apache's, nginx's or IIS's,
+// path prefix (plain HTTP is answered too, or sent to https where the
+// name has a certificate; another name of a site is sent to the one it is
+// reached at), applies the site's rewrite rules (Apache's, nginx's or IIS's,
 // read into one form), serves files itself and hands PHP to the site's
 // environment, PHP-FPM alone, over FastCGI.
 //
@@ -48,6 +50,10 @@ struct RouteIn {
     rules: String,
     text: String,
     off: String,
+    // https: a request over plain HTTP is sent to https (the name has a certificate).
+    https: bool,
+    // to: every request to this name is sent to that one (www and the name without it).
+    to: String,
 }
 
 #[derive(Clone)]
@@ -64,6 +70,8 @@ struct Route {
     rules: Arc<rewrite::Rules>,
     // What is answered instead of the site: "" for the site, "off", "expired".
     off: String,
+    https: bool,
+    to: String,
 }
 
 #[derive(Default)]
@@ -147,6 +155,8 @@ fn load(dir: &str) -> Table {
             auto: r.rules != "nginx" && r.rules != "iis",
             rules: Arc::new(rules),
             off: r.off,
+            https: r.https,
+            to: r.to.to_lowercase(),
         });
     }
     // The longest prefix first.
@@ -340,7 +350,7 @@ impl Entry {
         // What the visitor asked for, with its port: over HTTP/2 there is no
         // Host header, the name comes as the request's authority.
         let authority = req.uri.authority().map(|a| a.as_str().to_string()).or_else(|| req.headers.get("host").and_then(|h| h.to_str().ok()).map(str::to_string)).unwrap_or_else(|| host.to_string());
-        let port = authority.rsplit_once(':').map(|(_, p)| p.to_string()).filter(|p| p.parse::<u16>().is_ok()).unwrap_or_else(|| "443".into());
+        let port = authority.rsplit_once(':').map(|(_, p)| p.to_string()).filter(|p| p.parse::<u16>().is_ok()).unwrap_or_else(|| if self.tls { "443" } else { "80" }.into());
         let mut p: Vec<(String, String)> = vec![
             ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
             // Programs look here to know what the server can do: WordPress
@@ -348,8 +358,7 @@ impl Entry {
             ("SERVER_SOFTWARE".into(), "Apache (compatible; sites-entry)".into()),
             ("SERVER_PROTOCOL".into(), "HTTP/1.1".into()),
             ("REQUEST_METHOD".into(), req.method.as_str().into()),
-            ("REQUEST_SCHEME".into(), "https".into()),
-            ("HTTPS".into(), "on".into()),
+            ("REQUEST_SCHEME".into(), if self.tls { "https" } else { "http" }.into()),
             ("REQUEST_URI".into(), uri.into()),
             ("QUERY_STRING".into(), query.into()),
             ("DOCUMENT_ROOT".into(), route.fpm_root.clone()),
@@ -363,6 +372,9 @@ impl Entry {
             ("SERVER_PORT".into(), port),
             ("REDIRECT_STATUS".into(), "200".into()),
         ];
+        if self.tls {
+            p.push(("HTTPS".into(), "on".into()));
+        }
         if !path_info.is_empty() {
             p.push(("PATH_INFO".into(), path_info.into()));
         }
@@ -440,9 +452,6 @@ impl ProxyHttp for Entry {
             *ctx = Some(self.agent.clone());
             return Ok(false);
         }
-        if !self.tls {
-            return redirect(session, 301, &format!("https://{host}{uri}")).await;
-        }
         let Some(path) = decode(&raw_path) else {
             return plain(session, 400, "bad path\n").await;
         };
@@ -450,6 +459,15 @@ impl ProxyHttp for Entry {
         let Some(route) = route else {
             return plain(session, 404, "no such site\n").await;
         };
+        // Another name of the site: the visitor goes to the one it is to be reached at.
+        if !route.to.is_empty() {
+            let scheme = if self.tls || route.https { "https" } else { "http" };
+            return redirect(session, 301, &format!("{scheme}://{}{uri}", route.to)).await;
+        }
+        // Plain HTTP is answered as it is where the name has no certificate (yet).
+        if !self.tls && route.https {
+            return redirect(session, 301, &format!("https://{host}{uri}")).await;
+        }
         // The folder of a site under a prefix, asked for without its slash.
         if path == route.prefix && !route.prefix.is_empty() {
             return redirect(session, 301, &format!("{path}/{}", if query.is_empty() { String::new() } else { format!("?{query}") })).await;
@@ -464,7 +482,7 @@ impl ProxyHttp for Entry {
         let headers = req.headers.clone();
         let header = move |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         let rules = if route.auto { htaccess(&self.rules, &route.root) } else { route.rules.clone() };
-        let outcome = rewrite::apply(&rules, &rewrite::Req { path: inside, query, host: &host, https: true, root: &route.root, header: &header });
+        let outcome = rewrite::apply(&rules, &rewrite::Req { path: inside, query, host: &host, https: self.tls, root: &route.root, header: &header });
         let (mut rel, query) = match outcome {
             rewrite::Outcome::Redirect(code, to) => {
                 let to = if to.starts_with('/') { format!("{}{to}", route.prefix) } else { to };
