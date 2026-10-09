@@ -16,6 +16,7 @@
 
 mod fcgi;
 mod files;
+mod logs;
 mod rewrite;
 
 use std::collections::HashMap;
@@ -54,7 +55,21 @@ struct RouteIn {
     https: bool,
     // to: every request to this name is sent to that one (www and the name without it).
     to: String,
+    // site: what the site is called in the access logs and the traffic
+    // counted ("w12"); empty: neither is kept.
+    site: String,
+    // What a request to its PHP may be (docs/requirements/53, G-1), from its
+    // environment: the most a body may be (bytes), how long PHP may take to
+    // answer (seconds), how many requests may be at its PHP at once. 0: the
+    // entry's own (DEFAULT_*).
+    max_body: u64,
+    timeout: u64,
+    conns: u32,
 }
+
+const DEFAULT_MAX_BODY: u64 = 8 << 20;
+const DEFAULT_TIMEOUT: u64 = 60;
+const DEFAULT_CONNS: u32 = 4;
 
 #[derive(Clone)]
 struct Route {
@@ -72,6 +87,10 @@ struct Route {
     off: String,
     https: bool,
     to: String,
+    site: String,
+    max_body: u64,
+    timeout: Duration,
+    conns: u32,
 }
 
 #[derive(Default)]
@@ -184,6 +203,11 @@ fn load(dir: &str) -> Table {
             off: r.off,
             https: r.https,
             to: r.to.to_lowercase(),
+            // A name for a file: letters and digits only.
+            site: if !r.site.is_empty() && r.site.len() <= 32 && r.site.bytes().all(|b| b.is_ascii_alphanumeric()) { r.site } else { String::new() },
+            max_body: if r.max_body == 0 { DEFAULT_MAX_BODY } else { r.max_body },
+            timeout: Duration::from_secs(if r.timeout == 0 { DEFAULT_TIMEOUT } else { r.timeout.min(3600) }),
+            conns: if r.conns == 0 { DEFAULT_CONNS } else { r.conns.min(1024) },
         });
     }
     // The longest prefix first.
@@ -222,6 +246,23 @@ struct Entry {
     tls: bool,
     agent: String,
     rules: Rules,
+    // The kept connections to the environments' PHP-FPM.
+    pool: Arc<fcgi::Pool>,
+    // How many requests may be at each environment's PHP at once: its
+    // number of workers, by environment.
+    slots: Arc<Mutex<HashMap<String, (u32, Arc<tokio::sync::Semaphore>)>>>,
+    log: Arc<logs::Logs>,
+}
+
+// What the entry knows of a request as it ends: where it went, for the
+// log and the site's access log and traffic.
+#[derive(Default)]
+struct Ctx {
+    // The agent, for a certificate's proof; nothing else goes upstream.
+    peer: Option<String>,
+    what: String,
+    site: String,
+    started: Option<std::time::Instant>,
 }
 
 // ask asks the agent for an environment: it starts one that is not running
@@ -299,6 +340,99 @@ async fn redirect(session: &mut Session, code: u16, to: &str) -> Result<bool> {
     Ok(true)
 }
 
+// page is the site's own page for an answer the entry gives, at the top of
+// its folder as nginx's are usually written: 404.html for 404, 50x.html for
+// 500 and over. None where the site has none.
+fn page(route: &Route, code: u16) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let name = match code {
+        404 => "/404.html",
+        500..=599 => "/50x.html",
+        _ => return None,
+    };
+    let mut f = files::open(&route.root, name, libc::O_RDONLY).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.is_file() || m.len() > 1 << 20 {
+        return None;
+    }
+    let mut b = Vec::new();
+    f.read_to_end(&mut b).ok()?;
+    Some(b)
+}
+
+// fail answers with an error of the entry's: the site's own page for it
+// where it has one (G-2), else a line of text.
+async fn fail(session: &mut Session, route: &Route, code: u16, text: &str) -> Result<bool> {
+    let Some(body) = page(route, code) else {
+        return plain(session, code, text).await;
+    };
+    drain(session).await;
+    let mut h = ResponseHeader::build(code, None)?;
+    h.insert_header("Content-Type", "text/html; charset=utf-8")?;
+    h.insert_header("Content-Length", body.len().to_string())?;
+    h.insert_header("Cache-Control", "no-store")?;
+    session.write_response_header(Box::new(h), false).await?;
+    session.write_response_body(Some(Bytes::from(body)), true).await?;
+    Ok(true)
+}
+
+// too_large refuses a body over the site's limit without reading it: the
+// connection is closed after the answer.
+async fn too_large(session: &mut Session, route: &Route) -> Result<bool> {
+    let text = format!("the request is larger than this site takes ({} MB)\n", route.max_body >> 20);
+    session.set_keepalive(None);
+    let mut h = ResponseHeader::build(413, None)?;
+    h.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+    h.insert_header("Content-Length", text.len().to_string())?;
+    h.insert_header("Connection", "close")?;
+    session.write_response_header(Box::new(h), false).await?;
+    session.write_response_body(Some(Bytes::from(text)), true).await?;
+    Ok(true)
+}
+
+// compressible says whether a file of this type is sent compressed to a
+// visitor that takes it (Pingora's module decides by the same types).
+fn compressible(mime: &str) -> bool {
+    mime.starts_with("text/") || mime.contains("json") || mime.contains("xml") || mime.contains("javascript")
+}
+
+// cache_control is what a visitor's browser is told of keeping a file:
+// pages are asked about again each time (their ETag answers 304 when
+// unchanged), what pages are made of is kept a week.
+fn cache_control(mime: &str) -> &'static str {
+    if mime.starts_with("text/html") {
+        "no-cache"
+    } else if mime.starts_with("image/") || mime.starts_with("font/") || mime == "text/css" || mime == "text/javascript" || mime.starts_with("video/") {
+        "public, max-age=604800"
+    } else {
+        "public, max-age=3600"
+    }
+}
+
+// http_date writes a moment as HTTP does: Sun, 06 Nov 1994 08:49:37 GMT.
+fn http_date(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = civil(secs);
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{}, {d:02} {} {y} {h:02}:{mi:02}:{s:02} GMT", DAYS[((secs / 86400) % 7) as usize], MONTHS[mo as usize - 1])
+}
+
+// civil is a moment (seconds since 1970, UTC) as year, month, day, hour,
+// minute, second (Howard Hinnant's days_from_civil, backwards).
+fn civil(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let t = secs % 86400;
+    (y, m, d, t / 3600, t % 3600 / 60, t % 60)
+}
+
 fn io_err(what: &'static str, e: std::io::Error) -> Box<pingora::Error> {
     pingora::Error::because(pingora::ErrorType::InternalError, what, e)
 }
@@ -307,22 +441,33 @@ impl Entry {
     // file sends a file of the site, a part of it where a part is asked for.
     async fn file(&self, session: &mut Session, route: &Route, rel: &str) -> Result<bool> {
         let Ok(f) = files::open(&route.root, rel, libc::O_RDONLY) else {
-            return plain(session, 404, "not found\n").await;
+            return fail(session, route, 404, "not found\n").await;
         };
         let meta = f.metadata().map_err(|e| io_err("stat", e))?;
         let size = meta.len();
         let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
         let etag = format!("\"{mtime:x}-{size:x}\"");
+        let modified = http_date(mtime);
+        let mime = files::mime(rel);
         let get = |name: &str| session.req_header().headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
-        if get("if-none-match").as_deref() == Some(etag.as_str()) {
+        // Unchanged since the visitor's copy: by its ETag, or where it sent none by the date.
+        let same = match get("if-none-match") {
+            Some(tags) => tags.split(',').any(|t| t.trim().trim_start_matches("W/") == etag),
+            None => get("if-modified-since").as_deref() == Some(modified.as_str()),
+        };
+        if same {
             let mut h = ResponseHeader::build(304, None)?;
             h.insert_header("ETag", etag)?;
+            h.insert_header("Last-Modified", modified)?;
+            h.insert_header("Cache-Control", cache_control(mime))?;
             session.write_response_header(Box::new(h), true).await?;
             return Ok(true);
         }
+        // A part of a file that goes out compressed cannot be given: all of it then (as a server may).
+        let packed = compressible(mime) && get("accept-encoding").is_some_and(|a| a.contains("gzip") || a.contains("br") || a.contains("zstd"));
         // "bytes=a-b", "bytes=a-" or "bytes=-n": one part.
         let mut part: Option<(u64, u64)> = None;
-        if let Some(r) = get("range").and_then(|r| r.strip_prefix("bytes=").map(str::to_string)) {
+        if let Some(r) = get("range").filter(|_| !packed).and_then(|r| r.strip_prefix("bytes=").map(str::to_string)) {
             if let Some((a, b)) = r.split_once('-') {
                 part = match (a.parse::<u64>(), b.parse::<u64>()) {
                     (Ok(a), Ok(b)) if a <= b && a < size => Some((a, b.min(size - 1))),
@@ -342,9 +487,11 @@ impl Entry {
         let (from, to) = part.unwrap_or((0, size.saturating_sub(1)));
         let len = if size == 0 { 0 } else { to - from + 1 };
         let mut h = ResponseHeader::build(if part.is_some() { 206 } else { 200 }, None)?;
-        h.insert_header("Content-Type", files::mime(rel))?;
+        h.insert_header("Content-Type", mime)?;
         h.insert_header("Content-Length", len.to_string())?;
         h.insert_header("ETag", etag)?;
+        h.insert_header("Last-Modified", modified)?;
+        h.insert_header("Cache-Control", cache_control(mime))?;
         h.insert_header("Accept-Ranges", "bytes")?;
         if part.is_some() {
             h.insert_header("Content-Range", format!("bytes {from}-{to}/{size}"))?;
@@ -425,16 +572,39 @@ impl Entry {
             p.push(("HTTP_HOST".into(), authority));
         }
         let h2 = format!("{:?}", req.version).contains("2");
-        let Ok(mut conn) = fcgi::begin(fcgi_addr, &p).await else {
-            return plain(session, 502, "the site's PHP does not answer\n").await;
+        // A body larger than the site takes is refused before it is read.
+        let said: u64 = req.headers.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+        if said > route.max_body {
+            return too_large(session, route).await;
+        }
+        // As many at its PHP at once as it has workers; the others wait their turn, a while.
+        let slots = {
+            let mut all = self.slots.lock().unwrap();
+            let e = all.entry(route.env.clone()).or_insert_with(|| (route.conns, Arc::new(tokio::sync::Semaphore::new(route.conns as usize))));
+            if e.0 != route.conns {
+                *e = (route.conns, Arc::new(tokio::sync::Semaphore::new(route.conns as usize)));
+            }
+            e.1.clone()
         };
+        let Ok(Ok(_slot)) = tokio::time::timeout(Duration::from_secs(30), slots.acquire_owned()).await else {
+            return fail(session, route, 503, "the site is busy, try again\n").await;
+        };
+        let Ok(mut conn) = fcgi::begin(&self.pool, fcgi_addr, &p).await else {
+            return fail(session, route, 502, "the site's PHP does not answer\n").await;
+        };
+        let mut sent: u64 = 0;
         while let Some(chunk) = session.read_request_body().await? {
+            sent += chunk.len() as u64;
+            if sent > route.max_body {
+                return too_large(session, route).await;
+            }
             conn.stdin(&chunk).await.map_err(|e| io_err("to php", e))?;
         }
         conn.end_stdin().await.map_err(|e| io_err("to php", e))?;
-        let reply = match conn.headers().await {
-            Ok(r) => r,
-            Err(_) => return plain(session, 502, "the site's PHP gave no answer\n").await,
+        let reply = match tokio::time::timeout(route.timeout, conn.headers()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return fail(session, route, 502, "the site's PHP gave no answer\n").await,
+            Err(_) => return fail(session, route, 504, "the site's PHP took too long to answer\n").await,
         };
         let mut h = ResponseHeader::build(reply.status, None)?;
         let mut sized = false;
@@ -451,15 +621,21 @@ impl Entry {
             session.write_response_body(Some(Bytes::from(chunk)), false).await?;
         }
         session.write_response_body(None, true).await?;
+        // Its answer ended: the connection takes the next request.
+        self.pool.put(conn);
         Ok(true)
     }
 }
 
 #[async_trait]
 impl ProxyHttp for Entry {
-    type CTX = Option<String>;
+    type CTX = Ctx;
+    // Text goes out compressed to a visitor that takes it: brotli, zstd or gzip (G-2).
+    fn init_downstream_modules(&self, modules: &mut pingora::modules::http::HttpModules) {
+        modules.add_module(pingora::modules::http::compression::ResponseCompressionBuilder::enable(5));
+    }
     fn new_ctx(&self) -> Self::CTX {
-        None
+        Ctx { started: Some(std::time::Instant::now()), ..Default::default() }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -476,7 +652,8 @@ impl ProxyHttp for Entry {
         let uri = if query.is_empty() { raw_path.clone() } else { format!("{raw_path}?{query}") };
         // A certificate being issued is proved over plain HTTP: to the agent, which keeps the answers.
         if raw_path.starts_with("/.well-known/acme-challenge/") {
-            *ctx = Some(self.agent.clone());
+            ctx.peer = Some(self.agent.clone());
+            ctx.what = "acme".into();
             return Ok(false);
         }
         let Some(path) = decode(&raw_path) else {
@@ -486,6 +663,7 @@ impl ProxyHttp for Entry {
         let Some(route) = route else {
             return plain(session, 404, "no such site\n").await;
         };
+        ctx.site = route.site.clone();
         // Another name of the site: the visitor goes to the one it is to be reached at.
         if !route.to.is_empty() {
             let scheme = if self.tls || route.https { "https" } else { "http" };
@@ -532,7 +710,7 @@ impl ProxyHttp for Entry {
                 let index = ["index.php", "index.html", "index.htm"].iter().find(|i| files::kind(&route.root, &format!("{rel}{i}")) == Some(files::Kind::File));
                 match index {
                     Some(i) => rel = format!("{rel}{i}"),
-                    None => return plain(session, 403, "no index here\n").await,
+                    None => return fail(session, &route, 404, "no index here\n").await,
                 }
             }
             None => {
@@ -543,7 +721,7 @@ impl ProxyHttp for Entry {
                         path_info = rel[i..].to_string();
                         rel.truncate(i);
                     }
-                    _ => return plain(session, 404, "not found\n").await,
+                    _ => return fail(session, &route, 404, "not found\n").await,
                 }
             }
         }
@@ -554,22 +732,42 @@ impl ProxyHttp for Entry {
             let addr = match ask(&self.agent, &route.env).await {
                 Ok(a) => a,
                 Err(423) => return plain(session, 403, "this site's environment is off\n").await,
-                Err(_) => return plain(session, 503, "the site is starting or cannot be started, try again\n").await,
+                Err(_) => return fail(session, &route, 503, "the site is starting or cannot be started, try again\n").await,
             };
-            *ctx = Some(format!("php {}{}", route.env, rel));
+            ctx.what = format!("php {}{}", route.env, rel);
             return self.php(session, &route, &addr, &host, &rel, &path_info, &query, &uri).await;
         }
-        *ctx = Some(format!("file {rel}"));
+        ctx.what = format!("file {rel}");
         self.file(session, &route, &rel).await
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
-        Ok(Box::new(HttpPeer::new(ctx.clone().unwrap_or_default(), false, String::new())))
+        Ok(Box::new(HttpPeer::new(ctx.peer.clone().unwrap_or_default(), false, String::new())))
     }
 
     async fn logging(&self, session: &mut Session, _e: Option<&pingora::Error>, ctx: &mut Self::CTX) {
         let code = session.response_written().map_or(0, |r| r.status.as_u16());
-        info!("{} -> {} {}", self.request_summary(session, ctx), ctx.clone().unwrap_or_default(), code);
+        info!("{} -> {} {}", self.request_summary(session, ctx), ctx.what, code);
+        // The site's access log and traffic (G-5).
+        if !ctx.site.is_empty() {
+            let req = session.req_header();
+            let get = |name: &str| req.headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
+            let ip = session.client_addr().map(|a| a.to_string()).unwrap_or_default();
+            let ip = ip.rsplit_once(':').map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string()).unwrap_or(ip);
+            let line = logs::Line {
+                ip,
+                method: req.method.as_str().to_string(),
+                uri: req.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default(),
+                version: format!("{:?}", req.version),
+                status: code,
+                sent: session.body_bytes_sent() as u64,
+                read: session.body_bytes_read() as u64,
+                referer: get("referer"),
+                agent: get("user-agent"),
+                ms: ctx.started.map_or(0, |s| s.elapsed().as_millis() as u64),
+            };
+            self.log.add(&ctx.site, &line);
+        }
     }
 }
 
@@ -662,17 +860,21 @@ fn main() {
         }
     });
     let rules: Rules = Arc::new(Mutex::new(HashMap::new()));
+    let pool = Arc::new(fcgi::Pool::default());
+    let slots = Arc::new(Mutex::new(HashMap::new()));
+    let log = Arc::new(logs::Logs::new(PathBuf::from(format!("{dir}/logs"))));
+    log.clone().every(PathBuf::from(format!("{dir}/traffic.json")));
 
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
 
-    let mut https = http_proxy_service(&server.configuration, Entry { table: table.clone(), tls: true, agent: agent.clone(), rules: rules.clone() });
+    let mut https = http_proxy_service(&server.configuration, Entry { table: table.clone(), tls: true, agent: agent.clone(), rules: rules.clone(), pool: pool.clone(), slots: slots.clone(), log: log.clone() });
     let mut settings = TlsSettings::with_callbacks(Box::new(Certs(table.clone()))).unwrap();
     settings.enable_h2();
     https.add_tls_with_settings(&setting("SITES_HTTPS", "0.0.0.0:443"), None, settings);
     server.add_service(https);
 
-    let mut http = http_proxy_service(&server.configuration, Entry { table, tls: false, agent, rules });
+    let mut http = http_proxy_service(&server.configuration, Entry { table, tls: false, agent, rules, pool, slots, log });
     http.add_tcp(&setting("SITES_HTTP", "0.0.0.0:80"));
     server.add_service(http);
 

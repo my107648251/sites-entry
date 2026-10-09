@@ -475,7 +475,14 @@ pub fn nginx(text: &str) -> Rules {
     let mut quote: Option<char> = None;
     let mut parens = 0;
     let live = |stack: &Vec<(bool, usize, bool)>| stack.iter().all(|s| s.0);
+    // The rank of each open block, and of each rule made (by its block).
+    let mut order: Vec<(u8, i64)> = Vec::new();
+    let mut ranks: Vec<(u8, i64)> = Vec::new();
     for c in clean.chars() {
+        // Rules made since: of the innermost block open.
+        while ranks.len() < out.rules.len() {
+            ranks.push(order.last().copied().unwrap_or((0, 0)));
+        }
         if let Some(q) = quote {
             cur.push(c);
             if c == q {
@@ -500,14 +507,45 @@ pub fn nginx(text: &str) -> Rules {
                 let head = cur.trim().to_string();
                 cur.clear();
                 let w = words(&head);
+                // Where the block's rules go among the others: as nginx chooses its block.
+                order.push(if w.first().map(String::as_str) == Some("location") { location_rank(&w) } else { order.last().copied().unwrap_or((0, 0)) });
                 match w.first().map(String::as_str) {
                     Some("location") => {
-                        // Only what holds for every path is taken; a block for PHP files is ours to do anyway.
-                        let all = w.len() == 2 && w[1] == "/";
-                        if !all && !head.contains(".php") {
-                            out.skipped.push(format!("{head} {{ … }}"));
+                        // "location /" holds for every path; another for the paths it
+                        // names (G-3): by a prefix, "^~" a prefix, "=" the path
+                        // itself, "~" and "~*" a pattern. Its statements are taken
+                        // with that as their condition; the rules are put in the order
+                        // nginx chooses a block in (location_rank). nginx takes one
+                        // block; here a block's rules that do not apply leave the
+                        // request to the next block's.
+                        // A block for PHP files is ours to do anyway.
+                        let (modifier, what) = match w.len() {
+                            2 => ("", w[1].clone()),
+                            3 => (w[1].as_str(), w[2].clone()),
+                            _ => ("?", String::new()),
+                        };
+                        if modifier.is_empty() && what == "/" {
+                            stack.push((true, 0, true));
+                        } else if head.contains(".php") {
+                            stack.push((false, 0, false));
+                        } else {
+                            let cond = match modifier {
+                                "" | "^~" => Some(format!("$uri ~ \"^{}\"", fancy_regex::escape(&what))),
+                                "=" => Some(format!("$uri = \"{what}\"")),
+                                "~" | "~*" => Some(format!("$uri {modifier} \"{what}\"")),
+                                _ => None,
+                            };
+                            match cond {
+                                Some(c) if !what.contains('"') => {
+                                    conds.push(c);
+                                    stack.push((true, 1, true));
+                                }
+                                _ => {
+                                    out.skipped.push(format!("{head} {{ … }}"));
+                                    stack.push((false, 0, false));
+                                }
+                            }
                         }
-                        stack.push((all, 0, all));
                     }
                     Some("if") => {
                         let inner = head[2..].trim().trim_start_matches('(').trim_end_matches(')').trim().to_string();
@@ -523,6 +561,7 @@ pub fn nginx(text: &str) -> Rules {
             }
             '}' if parens == 0 => {
                 cur.clear();
+                order.pop();
                 if let Some((_, n, _)) = stack.pop() {
                     for _ in 0..n {
                         conds.pop();
@@ -632,6 +671,11 @@ pub fn nginx(text: &str) -> Rules {
                             out.skipped.push(stmt);
                         }
                     }
+                    // Kept from everyone: what the block is for (often .ht files, .git).
+                    "deny" if w.len() == 2 && w[1] == "all" => {
+                        let any = Regex::new("^").unwrap();
+                        out.rules.push(Rule { conds: here, re: any, negate: false, target: "-".into(), last: true, qsa: false, qsd: false, redirect: None, status: Some(403), abs: true, in_location, escape_args: false, source: stmt.clone() });
+                    }
                     // Ours to do, whatever is said of them.
                     "index" | "root" | "include" | "fastcgi_pass" | "fastcgi_index" | "fastcgi_param" | "fastcgi_split_path_info" | "listen" | "server_name" | "charset" | "access_log" | "error_log" | "expires" => {}
                     _ => out.skipped.push(stmt),
@@ -640,7 +684,33 @@ pub fn nginx(text: &str) -> Rules {
             _ => cur.push(c),
         }
     }
+    while ranks.len() < out.rules.len() {
+        ranks.push(order.last().copied().unwrap_or((0, 0)));
+    }
+    // In the order nginx looks at their blocks; within a block, as written.
+    let mut both: Vec<((u8, i64), Rule)> = ranks.into_iter().zip(std::mem::take(&mut out.rules)).collect();
+    both.sort_by_key(|(rank, _)| *rank);
+    out.rules = both.into_iter().map(|(_, rule)| rule).collect();
     out
+}
+
+// location_rank is where nginx looks at a location block among the others:
+// what is outside every block first (0), then "=" (1), "^~" prefixes, the
+// longest first (2), patterns as written (3), other prefixes, the longest
+// first (4), "/" last (5).
+fn location_rank(w: &[String]) -> (u8, i64) {
+    let (m, what) = match w.len() {
+        2 => ("", w[1].as_str()),
+        3 => (w[1].as_str(), w[2].as_str()),
+        _ => return (5, 0),
+    };
+    match m {
+        "=" => (1, 0),
+        "^~" => (2, -(what.len() as i64)),
+        "~" | "~*" => (3, 0),
+        _ if what == "/" => (5, 0),
+        _ => (4, -(what.len() as i64)),
+    }
 }
 
 // iis reads the rewrite rules of IIS's web.config.
@@ -743,4 +813,42 @@ pub fn iis(text: &str) -> Rules {
         out.rules.push(new);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(rules: &Rules, root: &Path, path: &str) -> String {
+        let header = |_: &str| String::new();
+        match apply(rules, &Req { path: path.into(), query: String::new(), host: "a.test", https: true, root, header: &header }) {
+            Outcome::Pass(p, q) => format!("pass {p} {q}"),
+            Outcome::Redirect(c, t) => format!("{c} {t}"),
+            Outcome::Status(c) => format!("status {c}"),
+        }
+    }
+
+    // Blocks for some paths (G-3): their statements only for those.
+    #[test]
+    fn nginx_locations() {
+        let root = std::env::temp_dir().join(format!("rw-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("blog")).unwrap();
+        std::fs::write(root.join("blog/index.php"), "").unwrap();
+        let r = nginx(
+            "location / { try_files $uri $uri/ /index.php?$args; }
+             location /admin/ { deny all; }
+             location = /old { return 301 /new; }
+             location ^~ /blog/ { try_files $uri $uri/ /blog/index.php?$args; }
+             location ~* \\.(bak|sql)$ { return 404; }
+             location ~ \\.php$ { fastcgi_pass 127.0.0.1:9000; }",
+        );
+        assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+        assert_eq!(run(&r, &root, "/admin/x"), "status 403");
+        assert_eq!(run(&r, &root, "/old"), "301 /new");
+        assert_eq!(run(&r, &root, "/oldest"), "pass /index.php ");
+        assert_eq!(run(&r, &root, "/blog/a/b"), "pass /blog/index.php ");
+        assert_eq!(run(&r, &root, "/db.SQL"), "status 404");
+        assert_eq!(run(&r, &root, "/x"), "pass /index.php ");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
