@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,7 +37,8 @@ pub struct Count {
 pub struct Logs {
     dir: PathBuf,
     boot: u64,
-    open: Mutex<HashMap<String, (File, u64)>>,
+    // Written through a buffer, put in the file every second (every).
+    open: Mutex<HashMap<String, (BufWriter<File>, u64)>>,
     counts: Mutex<HashMap<String, Count>>,
 }
 
@@ -93,7 +94,7 @@ impl Logs {
         if !open.contains_key(site) {
             let Ok(f) = OpenOptions::new().create(true).append(true).open(&file) else { return };
             let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-            open.insert(site.to_string(), (f, size));
+            open.insert(site.to_string(), (BufWriter::with_capacity(64 << 10, f), size));
         }
         let (f, size) = open.get_mut(site).unwrap();
         if f.write_all(text.as_bytes()).is_err() {
@@ -122,13 +123,27 @@ impl Logs {
         }
     }
 
-    // every writes the counts every half minute, and lets a log that was
-    // moved away (by hand) be opened again.
+    // flush puts what the logs hold in their files.
+    pub fn flush(&self) {
+        for (f, _) in self.open.lock().unwrap().values_mut() {
+            let _ = f.flush();
+        }
+    }
+
+    // every puts the logs in their files every second and writes the counts
+    // every half minute; a log that was moved away (by hand) is opened again.
     pub fn every(self: Arc<Self>, file: PathBuf) {
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(30));
-            self.write(&file);
-            self.open.lock().unwrap().retain(|site, _| self.dir.join(format!("{site}.log")).exists());
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                self.flush();
+                n += 1;
+                if n % 30 == 0 {
+                    self.write(&file);
+                    self.open.lock().unwrap().retain(|site, _| self.dir.join(format!("{site}.log")).exists());
+                }
+            }
         });
     }
 }
@@ -163,6 +178,7 @@ mod tests {
         let l = Line { ip: "1.2.3.4".into(), method: "GET".into(), uri: "/".into(), version: "HTTP/1.1".into(), status: 200, sent: 100, read: 7, referer: "-".into(), agent: "-".into(), ms: 1 };
         logs.add("w1", &l);
         logs.add("w1", &l);
+        logs.flush();
         let t = logs.traffic();
         assert_eq!(t["sites"]["w1"]["requests"], 2);
         assert_eq!(t["sites"]["w1"]["bytes_out"], 200);
@@ -173,6 +189,7 @@ mod tests {
         logs.add("w1", &l);
         assert!(dir.join("w1.log.1").exists());
         logs.add("w1", &l);
+        logs.flush();
         assert_eq!(std::fs::read_to_string(dir.join("w1.log")).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
