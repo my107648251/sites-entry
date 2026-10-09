@@ -65,6 +65,9 @@ struct RouteIn {
     max_body: u64,
     timeout: u64,
     conns: u32,
+    // proxy: the route is sent on to an instance of the site's user, at this
+    // "address:port" (plain HTTP inside); no folder, no PHP of its own.
+    proxy: String,
 }
 
 const DEFAULT_MAX_BODY: u64 = 8 << 20;
@@ -91,6 +94,7 @@ struct Route {
     max_body: u64,
     timeout: Duration,
     conns: u32,
+    proxy: String,
 }
 
 #[derive(Default)]
@@ -208,6 +212,8 @@ fn load(dir: &str) -> Table {
             max_body: if r.max_body == 0 { DEFAULT_MAX_BODY } else { r.max_body },
             timeout: Duration::from_secs(if r.timeout == 0 { DEFAULT_TIMEOUT } else { r.timeout.min(3600) }),
             conns: if r.conns == 0 { DEFAULT_CONNS } else { r.conns.min(1024) },
+            // An address and a port, or nothing.
+            proxy: r.proxy.parse::<std::net::SocketAddrV4>().map(|a| a.to_string()).unwrap_or_default(),
         });
     }
     // The longest prefix first.
@@ -673,6 +679,18 @@ impl ProxyHttp for Entry {
         if !self.tls && route.https {
             return redirect(session, 301, &format!("https://{host}{uri}")).await;
         }
+        // Sent on to an instance of its user: as it is asked for, to it.
+        if !route.proxy.is_empty() {
+            match route.off.as_str() {
+                "" => {}
+                "expired" => return plain(session, 403, "this site has expired\n").await,
+                "held" => return plain(session, 403, "this site has been stopped\n").await,
+                _ => return plain(session, 403, "this site is off\n").await,
+            }
+            ctx.peer = Some(route.proxy.clone());
+            ctx.what = format!("proxy {}", route.proxy);
+            return Ok(false);
+        }
         // The folder of a site under a prefix, asked for without its slash.
         if path == route.prefix && !route.prefix.is_empty() {
             return redirect(session, 301, &format!("{path}/{}", if query.is_empty() { String::new() } else { format!("?{query}") })).await;
@@ -680,6 +698,7 @@ impl ProxyHttp for Entry {
         match route.off.as_str() {
             "" => {}
             "expired" => return plain(session, 403, "this site has expired\n").await,
+            "held" => return plain(session, 403, "this site has been stopped\n").await,
             _ => return plain(session, 403, "this site is off\n").await,
         }
         // The rules see the path inside the site.
@@ -743,6 +762,27 @@ impl ProxyHttp for Entry {
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
         Ok(Box::new(HttpPeer::new(ctx.peer.clone().unwrap_or_default(), false, String::new())))
+    }
+
+    // What the instance a site is sent on to is told of the visitor: where
+    // it came from, and whether over https; the name it asked for is kept.
+    async fn upstream_request_filter(&self, session: &mut Session, upstream: &mut RequestHeader, _ctx: &mut Self::CTX) -> Result<()> {
+        let ip = session.client_addr().map(|a| a.to_string()).unwrap_or_default();
+        let ip = ip.rsplit_once(':').map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string()).unwrap_or(ip);
+        let fwd = match upstream.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            Some(before) => format!("{before}, {ip}"),
+            None => ip.clone(),
+        };
+        upstream.insert_header("X-Forwarded-For", fwd)?;
+        upstream.insert_header("X-Real-IP", ip)?;
+        upstream.insert_header("X-Forwarded-Proto", if self.tls { "https" } else { "http" })?;
+        // Over HTTP/2 the name comes as the authority: the instance is given it as Host.
+        if upstream.headers.get("host").is_none() {
+            if let Some(a) = upstream.uri.authority().map(|a| a.as_str().to_string()) {
+                upstream.insert_header("Host", a)?;
+            }
+        }
+        Ok(())
     }
 
     async fn logging(&self, session: &mut Session, _e: Option<&pingora::Error>, ctx: &mut Self::CTX) {
