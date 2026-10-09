@@ -42,6 +42,8 @@ pub struct Rule {
     pub in_location: bool,
     // nginx: what the pattern caught is escaped where it goes into the arguments.
     pub escape_args: bool,
+    // What it was written as, to say which rule a request met.
+    pub source: String,
 }
 
 #[derive(Default)]
@@ -167,6 +169,17 @@ fn caps(re: &Regex, s: &str) -> Option<Vec<String>> {
 }
 
 pub fn apply(rules: &Rules, r: &Req) -> Outcome {
+    run(rules, r, &mut Vec::new())
+}
+
+// trace is apply, saying also which rules the request met, in turn.
+pub fn trace(rules: &Rules, r: &Req) -> (Outcome, Vec<String>) {
+    let mut met = Vec::new();
+    let out = run(rules, r, &mut met);
+    (out, met.into_iter().map(|i| rules.rules[i].source.clone()).collect())
+}
+
+fn run(rules: &Rules, r: &Req, met: &mut Vec<usize>) -> Outcome {
     let (mut path, mut query) = (r.path.clone(), r.query.clone());
     if !rules.on {
         return Outcome::Pass(path, query);
@@ -175,7 +188,7 @@ pub fn apply(rules: &Rules, r: &Req) -> Outcome {
     let is_php = r.path.ends_with(".php") || r.path.contains(".php/");
     for _ in 0..10 {
         let mut changed = false;
-        for rule in &rules.rules {
+        for (index, rule) in rules.rules.iter().enumerate() {
             if rule.in_location && is_php {
                 continue;
             }
@@ -234,6 +247,7 @@ pub fn apply(rules: &Rules, r: &Req) -> Outcome {
             if !ok {
                 continue;
             }
+            met.push(index);
             if let Some(code) = rule.status {
                 return Outcome::Status(code);
             }
@@ -331,6 +345,8 @@ fn file_test(p: &str) -> Option<Test> {
 pub fn htaccess(text: &str, base: &str) -> Rules {
     let mut out = Rules { base: base.to_string(), restart: true, script_is_file: true, ..Default::default() };
     let mut conds: Vec<Cond> = Vec::new();
+    // The lines of the conditions a rule takes, for its source.
+    let mut cond_lines: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('<') {
@@ -346,6 +362,7 @@ pub fn htaccess(text: &str, base: &str) -> Rules {
                 out.base = if b.ends_with('/') { b } else { format!("{b}/") };
             }
             "rewritecond" if w.len() >= 3 => {
+                cond_lines.push(line.to_string());
                 let nocase = has("NC") || has("nocase");
                 let p = &w[2];
                 let test = if let Some(t) = file_test(p) {
@@ -377,6 +394,7 @@ pub fn htaccess(text: &str, base: &str) -> Rules {
                 let Some(r) = re(&pat, has("NC") || has("nocase")) else {
                     out.skipped.push(line.to_string());
                     conds.clear();
+                    cond_lines.clear();
                     continue;
                 };
                 let mut redirect = None;
@@ -406,6 +424,7 @@ pub fn htaccess(text: &str, base: &str) -> Rules {
                     abs: false,
                     in_location: false,
                     escape_args: false,
+                    source: std::mem::take(&mut cond_lines).into_iter().chain([line.to_string()]).collect::<Vec<_>>().join("\n"),
                 });
             }
             // What says nothing of rewriting and is harmless to pass over.
@@ -578,6 +597,7 @@ pub fn nginx(text: &str) -> Rules {
                             abs: true,
                             in_location,
                             escape_args: true,
+                            source: stmt.clone(),
                         });
                     }
                     "try_files" if w.len() >= 3 => {
@@ -592,22 +612,22 @@ pub fn nginx(text: &str) -> Rules {
                         let fallback = &w[w.len() - 1];
                         let any = Regex::new("^").unwrap();
                         if let Some(code) = fallback.strip_prefix('=') {
-                            out.rules.push(Rule { conds: here, re: any, negate: false, target: "-".into(), last: true, qsa: false, qsd: false, redirect: None, status: code.parse().ok(), abs: true, in_location, escape_args: false });
+                            out.rules.push(Rule { conds: here, re: any, negate: false, target: "-".into(), last: true, qsa: false, qsd: false, redirect: None, status: code.parse().ok(), abs: true, in_location, escape_args: false, source: stmt.clone() });
                         } else {
                             // "?$args" and the like: the request's own arguments, kept.
                             let mut t = fallback.replace("$is_args$args", "").replace("?$args", "").replace("&$args", "").replace("?$query_string", "").replace("&$query_string", "");
                             let qsa = t != *fallback || !t.contains('?');
                             t = nginx_var(&t);
-                            out.rules.push(Rule { conds: here, re: any, negate: false, target: t, last: true, qsa, qsd: false, redirect: None, status: None, abs: true, in_location, escape_args: false });
+                            out.rules.push(Rule { conds: here, re: any, negate: false, target: t, last: true, qsa, qsd: false, redirect: None, status: None, abs: true, in_location, escape_args: false, source: stmt.clone() });
                         }
                     }
                     "return" if w.len() >= 2 => {
                         let code: u16 = w[1].parse().unwrap_or(0);
                         let any = Regex::new("^").unwrap();
                         if (301..=308).contains(&code) && w.len() >= 3 {
-                            out.rules.push(Rule { conds: here, re: any, negate: false, target: nginx_var(&w[2]), last: true, qsa: false, qsd: false, redirect: Some(code), status: None, abs: true, in_location, escape_args: false });
+                            out.rules.push(Rule { conds: here, re: any, negate: false, target: nginx_var(&w[2]), last: true, qsa: false, qsd: false, redirect: Some(code), status: None, abs: true, in_location, escape_args: false, source: stmt.clone() });
                         } else if code >= 400 {
-                            out.rules.push(Rule { conds: here, re: any, negate: false, target: "-".into(), last: true, qsa: false, qsd: false, redirect: None, status: Some(code), abs: true, in_location, escape_args: false });
+                            out.rules.push(Rule { conds: here, re: any, negate: false, target: "-".into(), last: true, qsa: false, qsd: false, redirect: None, status: Some(code), abs: true, in_location, escape_args: false, source: stmt.clone() });
                         } else {
                             out.skipped.push(stmt);
                         }
@@ -694,6 +714,7 @@ pub fn iis(text: &str) -> Rules {
             abs: false,
             in_location: false,
             escape_args: false,
+            source: format!("<rule name=\"{name}\">"),
         };
         match kind {
             "Rewrite" => {}

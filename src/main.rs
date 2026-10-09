@@ -86,9 +86,9 @@ type Shared = Arc<RwLock<Table>>;
 /// moment the file was changed then (none: there was no file).
 type Rules = Arc<Mutex<HashMap<PathBuf, (Option<SystemTime>, Arc<rewrite::Rules>)>>>;
 
-// htaccess gives the rules of the .htaccess in a folder, read again where
-// the file changed since it was last read.
-fn htaccess(cache: &Rules, root: &Path) -> Arc<rewrite::Rules> {
+// htaccess gives the rules of the .htaccess in a folder (at base in the
+// site), read again where the file changed since it was last read.
+fn htaccess(cache: &Rules, root: &Path, base: &str) -> Arc<rewrite::Rules> {
     let file = root.join(".htaccess");
     let changed = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
     if let Some((at, r)) = cache.lock().unwrap().get(root) {
@@ -98,7 +98,7 @@ fn htaccess(cache: &Rules, root: &Path) -> Arc<rewrite::Rules> {
     }
     let r = Arc::new(match std::fs::read_to_string(&file) {
         Ok(text) => {
-            let r = rewrite::htaccess(&text, "/");
+            let r = rewrite::htaccess(&text, base);
             for s in &r.skipped {
                 warn!("{}: rule passed over: {s}", file.display());
             }
@@ -108,6 +108,33 @@ fn htaccess(cache: &Rules, root: &Path) -> Arc<rewrite::Rules> {
     });
     cache.lock().unwrap().insert(root.to_path_buf(), (changed, r.clone()));
     r
+}
+
+// htaccess_at gives the rules for a path of a site, as Apache does in its
+// folders: of the folders the path goes through (that are folders of the
+// site), the deepest whose .htaccess turns rewriting on, its rules for
+// what is under it. With the folder they are of, from the site's top.
+fn htaccess_at(cache: &Rules, root: &Path, path: &str) -> (Arc<rewrite::Rules>, String) {
+    let mut found = (htaccess(cache, root, "/"), "/".to_string());
+    if !found.0.on {
+        found.0 = Arc::new(rewrite::Rules::default());
+    }
+    let mut rel = String::from("/");
+    for seg in path.trim_start_matches('/').split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            break;
+        }
+        rel = format!("{rel}{seg}/");
+        // A folder of the site, not one a link leads out of it to.
+        if files::kind(root, &rel) != Some(files::Kind::Dir) {
+            break;
+        }
+        let r = htaccess(cache, &root.join(rel.trim_start_matches('/')), &rel);
+        if r.on {
+            found = (r, rel.clone());
+        }
+    }
+    found
 }
 
 // load reads the certificates and the routes the agent wrote.
@@ -481,7 +508,7 @@ impl ProxyHttp for Entry {
         let inside = path[route.prefix.len()..].to_string();
         let headers = req.headers.clone();
         let header = move |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-        let rules = if route.auto { htaccess(&self.rules, &route.root) } else { route.rules.clone() };
+        let rules = if route.auto { htaccess_at(&self.rules, &route.root, &inside).0 } else { route.rules.clone() };
         let outcome = rewrite::apply(&rules, &rewrite::Req { path: inside, query, host: &host, https: self.tls, root: &route.root, header: &header });
         let (mut rel, query) = match outcome {
             rewrite::Outcome::Redirect(code, to) => {
@@ -553,7 +580,67 @@ fn changed(dir: &str) -> Option<SystemTime> {
     a.max(b)
 }
 
+// cli is what the entry does from the command line, for the site agent to
+// ask it (docs/requirements/53, step 5), its answer JSON on stdout:
+//
+//   sites-entry check nginx|iis|htaccess   < rules
+//     the rules read, and the lines passed over
+//   sites-entry try ROOT auto|nginx|iis PATH?QUERY HOST [http] < rules
+//     what a request of the site whose folder is ROOT becomes: the rules
+//     met, and whether the file it comes to is there
+fn cli(args: &[String]) -> Option<i32> {
+    use std::io::Read;
+    let what = args.get(1)?.as_str();
+    if what != "check" && what != "try" {
+        return None;
+    }
+    let mut text = String::new();
+    let _ = std::io::stdin().read_to_string(&mut text);
+    let parse = |kind: &str| match kind {
+        "nginx" => rewrite::nginx(&text),
+        "iis" => rewrite::iis(&text),
+        _ => rewrite::htaccess(&text, "/"),
+    };
+    if what == "check" {
+        let r = parse(args.get(2).map(String::as_str).unwrap_or(""));
+        println!("{}", serde_json::json!({ "rules": r.rules.len(), "on": r.on, "skipped": r.skipped }));
+        return Some(0);
+    }
+    let (Some(root), Some(kind), Some(url)) = (args.get(2), args.get(3), args.get(4)) else {
+        eprintln!("usage: sites-entry try ROOT auto|nginx|iis PATH?QUERY HOST [http]");
+        return Some(2);
+    };
+    let host = args.get(5).cloned().unwrap_or_default();
+    let https = args.get(6).map(String::as_str) != Some("http");
+    let root = Path::new(root);
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let (rules, at) = if kind == "auto" {
+        let cache: Rules = Arc::new(Mutex::new(HashMap::new()));
+        htaccess_at(&cache, root, path)
+    } else {
+        (Arc::new(parse(kind)), String::new())
+    };
+    let header = |_: &str| String::new();
+    let (out, met) = rewrite::trace(&rules, &rewrite::Req { path: path.to_string(), query: query.to_string(), host: &host, https, root, header: &header });
+    let kind_of = |p: &str| match files::kind(root, p) {
+        Some(files::Kind::File) => "file",
+        Some(files::Kind::Dir) => "dir",
+        None => "none",
+    };
+    let answer = match out {
+        rewrite::Outcome::Pass(p, q) => serde_json::json!({ "outcome": "pass", "path": p, "query": q, "file": kind_of(&p), "met": met, "htaccess": at, "skipped": rules.skipped }),
+        rewrite::Outcome::Redirect(code, to) => serde_json::json!({ "outcome": "redirect", "code": code, "to": to, "met": met, "htaccess": at, "skipped": rules.skipped }),
+        rewrite::Outcome::Status(code) => serde_json::json!({ "outcome": "status", "code": code, "met": met, "htaccess": at, "skipped": rules.skipped }),
+    };
+    println!("{answer}");
+    Some(0)
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = cli(&args) {
+        std::process::exit(code);
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let dir = setting("SITES_DIR", "/var/lib/sites");
     let agent = setting("SITES_AGENT", "127.0.0.1:7071");
