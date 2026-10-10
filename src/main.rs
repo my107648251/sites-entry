@@ -68,6 +68,9 @@ struct RouteIn {
     // proxy: the route is sent on to an instance of the site's user, at this
     // "address:port" (plain HTTP inside); no folder, no PHP of its own.
     proxy: String,
+    // mimes: the kinds of files its site gives out besides the platform's,
+    // the ending of a name to its type (M-3).
+    mimes: HashMap<String, String>,
 }
 
 const DEFAULT_MAX_BODY: u64 = 8 << 20;
@@ -95,12 +98,19 @@ struct Route {
     timeout: Duration,
     conns: u32,
     proxy: String,
+    mimes: Arc<HashMap<String, String>>,
 }
 
 #[derive(Default)]
 struct Table {
     certs: HashMap<String, (X509, PKey<Private>)>,
     routes: Vec<Route>,
+    // The platform's table of the kinds of files given out, the ending of a
+    // name to its type (mime.json, M-1); none: the agent told none, and
+    // every file goes out as before there was a table.
+    mimes: Option<Arc<HashMap<String, String>>>,
+    // The page for a name no site has (nosite.html, M-6); none: a line of text.
+    nosite: Option<Bytes>,
 }
 
 type Shared = Arc<RwLock<Table>>;
@@ -214,7 +224,20 @@ fn load(dir: &str) -> Table {
             conns: if r.conns == 0 { DEFAULT_CONNS } else { r.conns.min(1024) },
             // An address and a port, or nothing.
             proxy: r.proxy.parse::<std::net::SocketAddrV4>().map(|a| a.to_string()).unwrap_or_default(),
+            mimes: Arc::new(r.mimes.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect()),
         });
+    }
+    // The platform's table, and the page for a name no site has: what the agent wrote, where it did.
+    if let Ok(b) = std::fs::read(format!("{dir}/mime.json")) {
+        match serde_json::from_slice::<HashMap<String, String>>(&b) {
+            Ok(m) => t.mimes = Some(Arc::new(m.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect())),
+            Err(e) => warn!("mime.json: {e}"),
+        }
+    }
+    if let Ok(b) = std::fs::read(format!("{dir}/nosite.html")) {
+        if !b.is_empty() && b.len() <= 256 << 10 {
+            t.nosite = Some(Bytes::from(b));
+        }
     }
     // The longest prefix first.
     t.routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
@@ -408,7 +431,7 @@ fn compressible(mime: &str) -> bool {
 fn cache_control(mime: &str) -> &'static str {
     if mime.starts_with("text/html") {
         "no-cache"
-    } else if mime.starts_with("image/") || mime.starts_with("font/") || mime == "text/css" || mime == "text/javascript" || mime.starts_with("video/") {
+    } else if mime.starts_with("image/") || mime.starts_with("font/") || mime.starts_with("text/css") || mime.starts_with("text/javascript") || mime.starts_with("video/") {
         "public, max-age=604800"
     } else {
         "public, max-age=3600"
@@ -445,7 +468,7 @@ fn io_err(what: &'static str, e: std::io::Error) -> Box<pingora::Error> {
 
 impl Entry {
     // file sends a file of the site, a part of it where a part is asked for.
-    async fn file(&self, session: &mut Session, route: &Route, rel: &str) -> Result<bool> {
+    async fn file(&self, session: &mut Session, route: &Route, rel: &str, mime: &str) -> Result<bool> {
         let Ok(f) = files::open(&route.root, rel, libc::O_RDONLY) else {
             return fail(session, route, 404, "not found\n").await;
         };
@@ -454,7 +477,6 @@ impl Entry {
         let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
         let etag = format!("\"{mtime:x}-{size:x}\"");
         let modified = http_date(mtime);
-        let mime = files::mime(rel);
         let get = |name: &str| session.req_header().headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
         // Unchanged since the visitor's copy: by its ETag, or where it sent none by the date.
         let same = match get("if-none-match") {
@@ -667,7 +689,20 @@ impl ProxyHttp for Entry {
         };
         let route = self.table.read().unwrap().routes.iter().find(|r| r.host == host && (r.prefix.is_empty() || path == r.prefix || path.starts_with(&format!("{}/", r.prefix)))).cloned();
         let Some(route) = route else {
-            return plain(session, 404, "no such site\n").await;
+            // A name no site has: the platform's page for it where it gave one (M-6).
+            let page = self.table.read().unwrap().nosite.clone();
+            let Some(page) = page else {
+                return plain(session, 404, "no such site\n").await;
+            };
+            ctx.what = "nosite".into();
+            drain(session).await;
+            let mut h = ResponseHeader::build(404, None)?;
+            h.insert_header("Content-Type", "text/html; charset=utf-8")?;
+            h.insert_header("Content-Length", page.len().to_string())?;
+            h.insert_header("Cache-Control", "no-store")?;
+            session.write_response_header(Box::new(h), false).await?;
+            session.write_response_body(Some(page), true).await?;
+            return Ok(true);
         };
         ctx.site = route.site.clone();
         // Another name of the site: the visitor goes to the one it is to be reached at.
@@ -756,8 +791,19 @@ impl ProxyHttp for Entry {
             ctx.what = format!("php {}{}", route.env, rel);
             return self.php(session, &route, &addr, &host, &rel, &path_info, &query, &uri).await;
         }
+        // Given out by the ending of its name: in the site's table or the
+        // platform's, or not at all (M-1 to M-5).
+        let platform = self.table.read().unwrap().mimes.clone();
+        let mime = match files::kind_of(&rel, platform.as_deref(), &route.mimes) {
+            files::Type::Is(m) => m,
+            files::Type::Script => return plain(session, 403, "not for reading\n").await,
+            files::Type::Unknown => {
+                ctx.what = format!("untyped {rel}");
+                return fail(session, &route, 404, "this kind of file is not given out here\n").await;
+            }
+        };
         ctx.what = format!("file {rel}");
-        self.file(session, &route, &rel).await
+        self.file(session, &route, &rel, &mime).await
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
@@ -813,9 +859,7 @@ impl ProxyHttp for Entry {
 
 // changed is when what the agent wrote last changed: the routes or the certificates.
 fn changed(dir: &str) -> Option<SystemTime> {
-    let a = std::fs::metadata(format!("{dir}/entry.json")).and_then(|m| m.modified()).ok();
-    let b = std::fs::metadata(format!("{dir}/certs")).and_then(|m| m.modified()).ok();
-    a.max(b)
+    ["entry.json", "certs", "mime.json", "nosite.html"].iter().filter_map(|f| std::fs::metadata(format!("{dir}/{f}")).and_then(|m| m.modified()).ok()).max()
 }
 
 // cli is what the entry does from the command line, for the site agent to

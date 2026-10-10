@@ -109,3 +109,79 @@ pub fn mime(path: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+/// What a file is given out as (docs/requirements/53, M-1 to M-5).
+#[derive(Debug, PartialEq)]
+pub enum Type {
+    /// Given out, as this type.
+    Is(String),
+    /// A script's ending other than .php (.phtml, .phar, .php5): never given out as a file.
+    Script,
+    /// An ending neither the platform's table nor the site's has: not given out.
+    Unknown,
+}
+
+fn script(ending: &str) -> bool {
+    matches!(ending, "phtml" | "pht" | "phps" | "phar") || (ending.len() == 4 && ending.starts_with("php") && ending.as_bytes()[3].is_ascii_digit())
+}
+
+/// The kind of a file by the ending of its name, as IIS does it: the site's
+/// own table first, then the platform's; an ending in neither is not given
+/// out, nor a name with no ending (but for what is under /.well-known/,
+/// which has none by custom). Where the entry was told no table (an agent
+/// from before there was one) every file goes out as before.
+pub fn kind_of(rel: &str, platform: Option<&std::collections::HashMap<String, String>>, site: &std::collections::HashMap<String, String>) -> Type {
+    let name = rel.rsplit('/').next().unwrap_or("");
+    let ending = match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => name[i + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    if script(&ending) {
+        return Type::Script;
+    }
+    let Some(platform) = platform else {
+        return Type::Is(mime(rel).to_string());
+    };
+    if ending.is_empty() {
+        return if rel.starts_with("/.well-known/") { Type::Is("text/plain; charset=utf-8".into()) } else { Type::Unknown };
+    }
+    match site.get(&ending).or_else(|| platform.get(&ending)) {
+        Some(t) => Type::Is(t.clone()),
+        None => Type::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn kinds() {
+        let platform: HashMap<String, String> = [("html", "text/html; charset=utf-8"), ("png", "image/png")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let site: HashMap<String, String> = [("dat", "application/octet-stream"), ("png", "image/x-mine")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let none = HashMap::new();
+        let k = |rel: &str| kind_of(rel, Some(&platform), &site);
+        assert_eq!(k("/index.html"), Type::Is("text/html; charset=utf-8".into()));
+        assert_eq!(k("/a/B.HTML"), Type::Is("text/html; charset=utf-8".into()));
+        // The site's own: one more ending, and its say over the platform's.
+        assert_eq!(k("/x.dat"), Type::Is("application/octet-stream".into()));
+        assert_eq!(k("/x.png"), Type::Is("image/x-mine".into()));
+        assert_eq!(kind_of("/x.dat", Some(&platform), &none), Type::Unknown);
+        // Not in either table: not given out.
+        for rel in ["/db.sql", "/site.bak", "/conf.inc", "/a.tar.xz", "/LICENSE", "/dir.d/readme", "/trailing."] {
+            assert_eq!(k(rel), Type::Unknown, "{rel}");
+        }
+        // A script's ending: never, though a site's table had it.
+        let sly: HashMap<String, String> = [("phtml", "text/plain"), ("php5", "text/plain")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        for rel in ["/a.phtml", "/a.PHAR", "/a.php5", "/a.pht", "/a.phps"] {
+            assert_eq!(kind_of(rel, Some(&platform), &sly), Type::Script, "{rel}");
+            assert_eq!(kind_of(rel, None, &none), Type::Script, "{rel}");
+        }
+        // No ending under /.well-known/: given out as text.
+        assert_eq!(k("/.well-known/apple-app-site-association"), Type::Is("text/plain; charset=utf-8".into()));
+        // No table told: as before, whatever the ending.
+        assert_eq!(kind_of("/db.sql", None, &none), Type::Is("application/octet-stream".into()));
+        assert_eq!(kind_of("/a.css", None, &none), Type::Is("text/css".into()));
+    }
+}
