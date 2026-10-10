@@ -71,11 +71,20 @@ struct RouteIn {
     // mimes: the kinds of files its site gives out besides the platform's,
     // the ending of a name to its type (M-3).
     mimes: HashMap<String, String>,
+    // index: the default documents of its site, in order: what a request for
+    // a folder is answered with, the first that is there (M-7). None: the entry's own.
+    index: Vec<String>,
+    // shop_url, shop_name: the shop its site is of: where the page shown while
+    // the site is off, expired or stopped leads, and what it is called (M-8).
+    shop_url: String,
+    shop_name: String,
 }
 
 const DEFAULT_MAX_BODY: u64 = 8 << 20;
 const DEFAULT_TIMEOUT: u64 = 60;
 const DEFAULT_CONNS: u32 = 4;
+// The default documents of a site that was told none.
+const DEFAULT_INDEX: [&str; 3] = ["index.php", "index.html", "index.htm"];
 
 #[derive(Clone)]
 struct Route {
@@ -99,6 +108,9 @@ struct Route {
     conns: u32,
     proxy: String,
     mimes: Arc<HashMap<String, String>>,
+    index: Arc<Vec<String>>,
+    shop_url: String,
+    shop_name: String,
 }
 
 #[derive(Default)]
@@ -111,6 +123,10 @@ struct Table {
     mimes: Option<Arc<HashMap<String, String>>>,
     // The page for a name no site has (nosite.html, M-6); none: a line of text.
     nosite: Option<Bytes>,
+    // What is shown instead of a site that is "off", "expired" or "held"
+    // (pages.json, M-8), with {{shop_url}} and {{shop_name}} for the route's;
+    // one not there: a line of text.
+    pages: HashMap<String, String>,
 }
 
 type Shared = Arc<RwLock<Table>>;
@@ -225,6 +241,14 @@ fn load(dir: &str) -> Table {
             // An address and a port, or nothing.
             proxy: r.proxy.parse::<std::net::SocketAddrV4>().map(|a| a.to_string()).unwrap_or_default(),
             mimes: Arc::new(r.mimes.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect()),
+            // An https address without what would end an attribute, or none.
+            shop_url: if r.shop_url.starts_with("https://") && !r.shop_url.contains(['"', '<', '>', '\'', ' ']) { r.shop_url } else { String::new() },
+            shop_name: r.shop_name,
+            // File names alone, never a path; none told: as before there was a list.
+            index: Arc::new(match r.index.into_iter().filter(|f| !f.is_empty() && !f.starts_with('.') && !f.contains('/') && !f.contains("..")).collect::<Vec<_>>() {
+                v if v.is_empty() => DEFAULT_INDEX.iter().map(|s| s.to_string()).collect(),
+                v => v,
+            }),
         });
     }
     // The platform's table, and the page for a name no site has: what the agent wrote, where it did.
@@ -232,6 +256,12 @@ fn load(dir: &str) -> Table {
         match serde_json::from_slice::<HashMap<String, String>>(&b) {
             Ok(m) => t.mimes = Some(Arc::new(m.into_iter().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect())),
             Err(e) => warn!("mime.json: {e}"),
+        }
+    }
+    if let Ok(b) = std::fs::read(format!("{dir}/pages.json")) {
+        match serde_json::from_slice::<HashMap<String, String>>(&b) {
+            Ok(p) => t.pages = p,
+            Err(e) => warn!("pages.json: {e}"),
         }
     }
     if let Ok(b) = std::fs::read(format!("{dir}/nosite.html")) {
@@ -360,6 +390,23 @@ async fn plain(session: &mut Session, code: u16, text: &str) -> Result<bool> {
     Ok(true)
 }
 
+// html answers with a page of the platform's own, never kept by the visitor.
+async fn html(session: &mut Session, code: u16, page: Bytes) -> Result<bool> {
+    drain(session).await;
+    let mut h = ResponseHeader::build(code, None)?;
+    h.insert_header("Content-Type", "text/html; charset=utf-8")?;
+    h.insert_header("Content-Length", page.len().to_string())?;
+    h.insert_header("Cache-Control", "no-store")?;
+    session.write_response_header(Box::new(h), false).await?;
+    session.write_response_body(Some(page), true).await?;
+    Ok(true)
+}
+
+// escape is text as it goes into a page.
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
 async fn redirect(session: &mut Session, code: u16, to: &str) -> Result<bool> {
     drain(session).await;
     let mut h = ResponseHeader::build(code, None)?;
@@ -467,6 +514,23 @@ fn io_err(what: &'static str, e: std::io::Error) -> Box<pingora::Error> {
 }
 
 impl Entry {
+    // stopped answers for a site that is off, expired or stopped: the
+    // platform's page for it, leading to the shop the site is of (M-8), where
+    // the entry was given one and the route says its shop; else a line.
+    async fn stopped(&self, session: &mut Session, route: &Route) -> Result<bool> {
+        let (key, line) = match route.off.as_str() {
+            "expired" => ("expired", "this site has expired\n"),
+            "held" => ("held", "this site has been stopped\n"),
+            _ => ("off", "this site is off\n"),
+        };
+        let page = if route.shop_url.is_empty() { None } else { self.table.read().unwrap().pages.get(key).cloned() };
+        let Some(page) = page else {
+            return plain(session, 403, line).await;
+        };
+        let name = if route.shop_name.is_empty() { route.shop_url.trim_start_matches("https://").trim_end_matches('/') } else { route.shop_name.as_str() };
+        html(session, 403, Bytes::from(page.replace("{{shop_url}}", &escape(&route.shop_url)).replace("{{shop_name}}", &escape(name)))).await
+    }
+
     // file sends a file of the site, a part of it where a part is asked for.
     async fn file(&self, session: &mut Session, route: &Route, rel: &str, mime: &str) -> Result<bool> {
         let Ok(f) = files::open(&route.root, rel, libc::O_RDONLY) else {
@@ -695,14 +759,7 @@ impl ProxyHttp for Entry {
                 return plain(session, 404, "no such site\n").await;
             };
             ctx.what = "nosite".into();
-            drain(session).await;
-            let mut h = ResponseHeader::build(404, None)?;
-            h.insert_header("Content-Type", "text/html; charset=utf-8")?;
-            h.insert_header("Content-Length", page.len().to_string())?;
-            h.insert_header("Cache-Control", "no-store")?;
-            session.write_response_header(Box::new(h), false).await?;
-            session.write_response_body(Some(page), true).await?;
-            return Ok(true);
+            return html(session, 404, page).await;
         };
         ctx.site = route.site.clone();
         // Another name of the site: the visitor goes to the one it is to be reached at.
@@ -716,11 +773,9 @@ impl ProxyHttp for Entry {
         }
         // Sent on to an instance of its user: as it is asked for, to it.
         if !route.proxy.is_empty() {
-            match route.off.as_str() {
-                "" => {}
-                "expired" => return plain(session, 403, "this site has expired\n").await,
-                "held" => return plain(session, 403, "this site has been stopped\n").await,
-                _ => return plain(session, 403, "this site is off\n").await,
+            if !route.off.is_empty() {
+                ctx.what = route.off.clone();
+                return self.stopped(session, &route).await;
             }
             ctx.peer = Some(route.proxy.clone());
             ctx.what = format!("proxy {}", route.proxy);
@@ -730,11 +785,9 @@ impl ProxyHttp for Entry {
         if path == route.prefix && !route.prefix.is_empty() {
             return redirect(session, 301, &format!("{path}/{}", if query.is_empty() { String::new() } else { format!("?{query}") })).await;
         }
-        match route.off.as_str() {
-            "" => {}
-            "expired" => return plain(session, 403, "this site has expired\n").await,
-            "held" => return plain(session, 403, "this site has been stopped\n").await,
-            _ => return plain(session, 403, "this site is off\n").await,
+        if !route.off.is_empty() {
+            ctx.what = route.off.clone();
+            return self.stopped(session, &route).await;
         }
         // The rules see the path inside the site.
         let inside = path[route.prefix.len()..].to_string();
@@ -761,7 +814,7 @@ impl ProxyHttp for Entry {
                 if !rel.ends_with('/') {
                     return redirect(session, 301, &format!("{}{rel}/{}", route.prefix, if query.is_empty() { String::new() } else { format!("?{query}") })).await;
                 }
-                let index = ["index.php", "index.html", "index.htm"].iter().find(|i| files::kind(&route.root, &format!("{rel}{i}")) == Some(files::Kind::File));
+                let index = route.index.iter().find(|i| files::kind(&route.root, &format!("{rel}{i}")) == Some(files::Kind::File));
                 match index {
                     Some(i) => rel = format!("{rel}{i}"),
                     None => return fail(session, &route, 404, "no index here\n").await,
@@ -859,7 +912,7 @@ impl ProxyHttp for Entry {
 
 // changed is when what the agent wrote last changed: the routes or the certificates.
 fn changed(dir: &str) -> Option<SystemTime> {
-    ["entry.json", "certs", "mime.json", "nosite.html"].iter().filter_map(|f| std::fs::metadata(format!("{dir}/{f}")).and_then(|m| m.modified()).ok()).max()
+    ["entry.json", "certs", "mime.json", "nosite.html", "pages.json"].iter().filter_map(|f| std::fs::metadata(format!("{dir}/{f}")).and_then(|m| m.modified()).ok()).max()
 }
 
 // cli is what the entry does from the command line, for the site agent to
